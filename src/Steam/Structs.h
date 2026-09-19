@@ -209,6 +209,11 @@ using KeyValuesSystemSteam_t = IKeyValuesSystem* (*)();
 struct CNetPacket
 {
 	HCONNECTION m_hConnection;
+	// Steam client beta (steamclient64 d2d085e7+) inserted two per-packet
+	// version stamps here, shifting m_pubData/m_cubData +8 bytes. Fields are
+	// set from the CNetPacket ctor (netpacket.cpp sub_138E81B60); unused by us.
+	uint32 m_unVersionStamp1;
+	uint32 m_unVersionStamp2;
 	uint8* m_pubData;
 	uint32 m_cubData;
 	int32 m_cRef;

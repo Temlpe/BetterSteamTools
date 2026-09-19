@@ -21,13 +21,11 @@
 // ═══════════════════════════════════════════════════════════════════
 namespace {
 
-    // Synchronous pre-seed budget. Most manifests are Cloudflare edge hits
-    // (~100-300 ms), so a typical game finishes well under the total budget; the
-    // short per-fetch timeout keeps one slow/missing manifest from stalling
-    // Steam, and once the total budget is spent the remaining depots fall back to
-    // a detached (async) fetch so a huge or slow install never freezes Steam.
+    // Per-fetch timeout for the on-demand pre-seed in YldLoadDepotManifest. Most
+    // manifests are Cloudflare edge hits (~100-300 ms); this cap keeps one slow or
+    // missing manifest from stalling Steam for long, and on timeout the original
+    // simply takes its normal path, so the worst case is the old behaviour.
     constexpr uint32_t kPreseedFetchTimeoutMs = 5000;
-    constexpr int64_t  kPreseedBudgetMs       = 15000;
 
     // When a pre-seed sweep finds manifests that are not archived yet (404), the
     // depots are collected here and, after a short quiet period, surfaced in one
@@ -111,59 +109,6 @@ namespace {
         });
     }
 
-    // Synchronously ensure the archived manifest is on disk before we hand the
-    // depot list back to Steam — but ONLY for depots a lua explicitly pins.
-    //
-    // The point of pre-seeding is to fetch the manifest the download is KNOWN to
-    // use, and a setManifestid pin is the only thing that states that gid. It was
-    // patched into e.ManifestGid by the override pass just above, so a pinned
-    // entry is correct by construction.
-    //
-    // Every other lua depot is deliberately skipped. Here e.ManifestGid is only
-    // whatever Steam had cached from appinfo, which is not the gid Steam will end
-    // up requesting (see the note in Hooks_NetPacket_Manifest::HandleSend), so
-    // fetching on it is a guess: it either 404s or lands a manifest Steam never
-    // reads. Those depots are already covered on demand by that same HandleSend,
-    // which fires with the gid Steam states outright. Commenting out a pin puts a
-    // depot in exactly this bucket — its addappid line keeps the depot key, but
-    // without the pin there is no known gid to pre-seed.
-    //
-    // Fetches run within a shared wall-clock deadline; past it, remaining depots
-    // are fetched detached so Steam is never hung. Already-cached depots cost only
-    // a stat.
-    void PreseedDepots(AppId_t appId, const CUtlVector<DepotEntry>* vec,
-                       const std::unordered_map<uint64_t, LuaConfig::ManifestOverride>& overrides,
-                       std::chrono::steady_clock::time_point deadline)
-    {
-        if (!vec) return;
-        for (uint32 i = 0; i < vec->m_Size; ++i) {
-            const DepotEntry& e = vec->m_Memory.m_pMemory[i];
-            if (!e.DepotId || !e.ManifestGid) continue;
-
-            if (!overrides.count(e.DepotId)) continue;   // not pinned: HandleSend owns it
-
-            const AppId_t app   = appId;
-            const uint32  depot = e.DepotId;
-            const uint64  gid   = e.ManifestGid;   // pinned gid already patched in
-
-            if (std::chrono::steady_clock::now() < deadline) {
-                // Within budget: block until the manifest is on disk (or the short
-                // per-fetch timeout elapses). A miss just returns false and Steam
-                // falls through to its normal request-code path. This sweep runs
-                // at startup for the whole library, so it stays SILENT on 404 -
-                // the "not ready" prompt is raised only on a real download attempt
-                // (HandleSend), never here.
-                ManifestCache::EnsureCached(app, depot, gid, kPreseedFetchTimeoutMs);
-            } else {
-                // Budget spent: stop blocking Steam; fetch the remainder async.
-                OSTPlatform::Thread::StartDetached([app, depot, gid]() -> uint32_t {
-                    ManifestCache::EnsureCached(app, depot, gid);
-                    return 0;
-                });
-            }
-        }
-    }
-
     HOOK_FUNC(BuildDepotDependency, bool, void* pUserAppMgr, AppId_t AppId,
               void* pUserConfig, CUtlVector<DepotEntry>* pDepotInfo,
               CUtlVector<DepotEntry>* pSharedDepotInfo, void* pSteamApp,
@@ -190,6 +135,42 @@ namespace {
 
         if (!result) return result;
 
+        // Steam reports zero depots for an app during the window where its
+        // appinfo is being swapped in by a PICS refresh — the old depot set is
+        // dropped before the new one lands. Observed directly for app 3293260:
+        // nCount=1 (old gid) -> nCount=0 -> nCount=1 (new gid), ~9s apart. BST
+        // widens that window because the fake license adds thousands of apps at
+        // once, forcing a large PICS refresh right after login.
+        //
+        // The caller (steamclient sub_138517140, the depot-config writer) takes
+        // whatever comes back and stores it, so acting on the transient writes
+        // an EMPTY depot config. The update job then reads that, logs
+        // "0 active: 0 target", commits nothing, and still stamps the app Fully
+        // Installed at the new BuildID — an install that silently "completes"
+        // having downloaded nothing, which is the instant-complete bug.
+        //
+        // Returning false makes that caller bail on its clean failure path and
+        // keep the app's previous depot config, so the next pass (once appinfo
+        // has landed) builds it properly. Scoped to apps a lua declares depots
+        // for; an app that genuinely has none is left alone.
+        //
+        // Only pDepotInfo is tested. pSharedDepotInfo holds depots belonging to
+        // OTHER apps (sharedinstall / depotfromapp redirects — redistributables
+        // and launchers), so it says nothing about whether this app's own config
+        // is sound. Testing it too is what let app 3751260 through on 2026-09-20:
+        // its own list was empty but one shared entry (depot 228989 of app
+        // 228980) was present, so the guard missed and Steam stored the empty
+        // config, finishing with "0 mounted depots".
+        if (AppId != 0 &&
+            (!pDepotInfo || pDepotInfo->m_Size == 0) &&
+            LuaConfig::HasDepot(AppId, false))
+        {
+            LOG_MANIFEST_WARN("BuildDepotDependency: app {} returned 0 depots "
+                "(appinfo mid-refresh) — failing the call so Steam keeps its "
+                "existing depot config instead of storing an empty one", AppId);
+            return false;
+        }
+
         // Before the override pass, so what is cached is Steam's GID.
         RecordDepots(pDepotInfo);
         RecordDepots(pSharedDepotInfo);
@@ -213,19 +194,19 @@ namespace {
             }
         }
 
-        // Pre-seed <steam>\depotcache SYNCHRONOUSLY for every lua-pinned depot,
-        // using the pinned gid patched in above. Doing this before returning means
-        // the manifest is on disk before Steam's first manifest-request-code call,
-        // so a pinned install starts on the first press instead of failing and
-        // needing a retry. Bounded: each fetch has a short timeout, and once the
-        // total budget is spent the rest fall back to a detached fetch so a large
-        // or slow install can never hang Steam's thread. Already-cached depots cost
-        // only a stat (EnsureCached's fs::exists short-circuit), so this is cheap
-        // except on a genuinely new install.
-        const auto deadline = std::chrono::steady_clock::now() +
-                              std::chrono::milliseconds(kPreseedBudgetMs);
-        PreseedDepots(AppId, pDepotInfo, overrides, deadline);
-        PreseedDepots(AppId, pSharedDepotInfo, overrides, deadline);
+        // No pre-seeding here. It used to run a synchronous sweep over the depot
+        // list on Steam's own thread, fetching manifests for every pinned depot
+        // while Steam was still building depot configs at startup — speculative
+        // work for games that may never be downloaded, and nothing after this
+        // point reads the file anyway.
+        //
+        // YldLoadDepotManifest now covers it properly: it fires at the per-manifest
+        // acquire chokepoint, immediately before the original's own disk check, so
+        // the fetch happens only for a manifest Steam is asking for right now, and
+        // it reaches pinned depots too (the pinned gid was patched into the depot
+        // config just above, so that is the gid Steam goes on to request). It also
+        // covers what this sweep never could: unpinned depots and workshop items,
+        // which do not pass through BuildDepotDependency at all.
         return result;
     }
 
