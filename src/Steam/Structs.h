@@ -206,20 +206,13 @@ struct IKeyValuesSystem {
 };
 using KeyValuesSystemSteam_t = IKeyValuesSystem* (*)();
 
-struct CNetPacket
-{
-	HCONNECTION m_hConnection;
-	// Steam client beta (steamclient64 d2d085e7+) inserted two per-packet
-	// version stamps here, shifting m_pubData/m_cubData +8 bytes. Fields are
-	// set from the CNetPacket ctor (netpacket.cpp sub_138E81B60); unused by us.
-	uint32 m_unVersionStamp1;
-	uint32 m_unVersionStamp2;
-	uint8* m_pubData;
-	uint32 m_cubData;
-	int32 m_cRef;
-	uint8* m_pubNetworkBuffer;
-	CNetPacket* m_pNext;
-};
+// Deliberately opaque — its layout moved between Steam client builds (the beta
+// inserted two uint32 version stamps after m_hConnection, shifting the rest by
+// 8), so declaring fields here would hardcode one client version and wild-write
+// on the other. Reach m_pubData/m_cubData through NetPkt::Data()/Size() in
+// Steam/NetPacket.h, which carries the full layout table and detects which one
+// this client uses at runtime.
+struct CNetPacket;
 
 struct MsgHdr
 {

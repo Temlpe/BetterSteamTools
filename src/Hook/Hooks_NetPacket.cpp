@@ -15,6 +15,9 @@
 #include "Utils/Tickets/EticketClient.h"
 #include "Utils/Support/FnvHash.h"
 #include "Utils/CloudRedirect/CloudRedirectHost.h"
+#include "Steam/NetPacket.h"
+#include "OSTPlatform/include/Memory.h"
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -66,6 +69,134 @@ namespace {
     }
 
 
+    // ── CNetPacket layout detection ────────────────────────────
+    // The beta client shifted m_pubData/m_cubData by +8 (see Steam/NetPacket.h),
+    // so the offsets are identified from a live packet instead of compiled in.
+    //
+    // The bar is deliberately high. A failed probe costs one packet — it is
+    // passed through untouched and the next one is tried. A wrong latch costs a
+    // wild pointer write into a live Steam object from four call sites plus a
+    // corrupted refcount, so every additional check is worth its deferral.
+    constexpr uint32   kProbeMaxPacket   = 1u << 20;   // 1 MiB; NOT kMaxPacketSize — a
+                                                       // large Multi must not fail the true candidate
+    constexpr uint32   kProbeMaxHdrLen   = 8192;
+    constexpr uintptr_t kProbeMinPtr     = 0x10000;
+    constexpr uintptr_t kProbeMaxPtr     = 0x7FFFFFFF0000ull;
+    constexpr int      kProbeMaxAttempts = 512;
+
+    int      g_ProbeAttempts = 0;
+    uint32_t g_ProbeAgreed   = NetPkt::kUnresolved;   // candidate that won the previous packet
+    bool     g_ProbeLogged   = false;
+
+    // Does `dataOff` describe this packet? Reads nothing it has not first
+    // proved readable.
+    bool ProbeLayout(const void* base, uint32_t dataOff)
+    {
+        namespace Mem = OSTPlatform::Memory;
+        const uint8* p = static_cast<const uint8*>(base);
+
+        // data (8) + size (4) + cRef (4)
+        if (!Mem::IsReadable(p + dataOff, 0x10)) return false;
+
+        const uint8* ptr  = *reinterpret_cast<const uint8* const*>(p + dataOff);
+        const uint32 size = *reinterpret_cast<const uint32*>(p + dataOff + 8);
+        const int32  cRef = *reinterpret_cast<const int32*>(p + dataOff + 0x0C);
+
+        const uintptr_t addr = reinterpret_cast<uintptr_t>(ptr);
+        if (addr < kProbeMinPtr || addr >= kProbeMaxPtr)      return false;
+        if (size < sizeof(MsgHdr) || size > kProbeMaxPacket)  return false;
+        if (cRef < 1 || cRef > 4096)                          return false;
+
+        if (!Mem::IsReadable(ptr, sizeof(MsgHdr))) return false;
+
+        // Read the header dword raw. EMsg is an unscoped enum with a signed
+        // underlying type, so testing 0x80000000 through MsgHdr::eMsg only
+        // works by accident.
+        const uint32 raw    = *reinterpret_cast<const uint32*>(ptr);
+        const uint32 hdrLen = *reinterpret_cast<const uint32*>(ptr + 4);
+        if (!(raw & kMsgHdrProtoFlag))                        return false;
+        const uint32 eMsg = raw & ~kMsgHdrProtoFlag;
+        if (eMsg == 0 || eMsg >= 0x10000)                     return false;
+        if (hdrLen < 2 || hdrLen > (std::min)(size - static_cast<uint32>(sizeof(MsgHdr)), kProbeMaxHdrLen))
+            return false;
+
+        if (!Mem::IsReadable(ptr, sizeof(MsgHdr) + hdrLen)) return false;
+
+        // Strongest signal available: the bytes actually are a Steam protobuf
+        // header. Only ever runs while probing.
+        CMsgProtoBufHeader hdr;
+        if (!hdr.ParseFromArray(ptr + sizeof(MsgHdr), static_cast<int>(hdrLen))) return false;
+
+        return true;
+    }
+
+    // Identify the layout from one packet. Latches only when exactly one
+    // candidate matches and the same candidate also won the previous packet:
+    // ambiguity is the one thing we must never latch on, and requiring two
+    // agreeing packets costs at most one early proto message.
+    bool TryResolveLayout(const CNetPacket* pPacket)
+    {
+        if (NetPkt::IsDisabled()) return false;
+
+        if (++g_ProbeAttempts > kProbeMaxAttempts) {
+            if (!g_ProbeLogged) {
+                g_ProbeLogged = true;
+                NetPkt::Disable();
+                LOG_NETPACKET_ERROR(
+                    "CNetPacket layout unidentified after {} packets - netpacket features "
+                    "disabled for this session (no field will be touched). This means the "
+                    "client's layout matches no known candidate; add one to NetPkt::kLayouts.",
+                    kProbeMaxAttempts);
+            }
+            return false;
+        }
+
+        uint32_t winner = NetPkt::kUnresolved;
+        int      passes = 0;
+        for (const auto& layout : NetPkt::kLayouts) {
+            if (ProbeLayout(pPacket, layout.dataOff)) {
+                ++passes;
+                winner = layout.dataOff;
+            }
+        }
+
+        if (passes == 0) {
+            // No candidate matched, which is what a non-protobuf frame looks
+            // like — it carries no evidence either way. Leave any standing
+            // agreement intact: discarding it here would mean one interleaved
+            // non-proto packet restarts the confirmation, which is exactly what
+            // early connection traffic does.
+            LOG_NETPACKET_TRACE("CNetPacket probe: no candidate matched (attempt {}), "
+                                "likely a non-proto frame", g_ProbeAttempts);
+            return false;
+        }
+        if (passes > 1) {
+            // Genuine ambiguity — both layouts read as valid on the same
+            // packet. That IS evidence, and it says do not trust the standing
+            // agreement.
+            LOG_NETPACKET_TRACE("CNetPacket probe: {} candidates matched, ambiguous (attempt {})",
+                                passes, g_ProbeAttempts);
+            g_ProbeAgreed = NetPkt::kUnresolved;
+            return false;
+        }
+        if (g_ProbeAgreed != winner) {
+            LOG_NETPACKET_TRACE("CNetPacket probe: candidate 0x{:X} matched, awaiting confirmation",
+                                winner);
+            g_ProbeAgreed = winner;
+            return false;
+        }
+
+        const char* name = "?";
+        for (const auto& layout : NetPkt::kLayouts)
+            if (layout.dataOff == winner) name = layout.name;
+
+        NetPkt::Latch(winner);
+        LOG_NETPACKET_INFO("CNetPacket layout = {} (m_pubData +0x{:X}, m_cubData +0x{:X}), "
+                           "confirmed on two consecutive packets after {} attempt(s)",
+                           name, winner, winner + 8, g_ProbeAttempts);
+        return true;
+    }
+
     // ── Packet layout ──────────────────────────────────────────
     inline bool UnpackRaw(const uint8* data, uint32 size,
                           EMsg& eMsg, const uint8*& pHdr, uint32& cbHdr,
@@ -85,8 +216,11 @@ namespace {
 
         eMsg  = static_cast<EMsg>(hdr->eMsg & ~kMsgHdrProtoFlag);
         cbHdr = hdr->headerLength;
+        // Subtract rather than add: `sizeof(MsgHdr) + cbHdr` wraps for cbHdr
+        // near UINT32_MAX, which passed the bounds test and put pBody behind
+        // data with a ~4 GB cbBody. size >= sizeof(MsgHdr) holds from above.
+        if (cbHdr > size - sizeof(MsgHdr)) goto fail;
         uint32 off = sizeof(MsgHdr) + cbHdr;
-        if (off > size) goto fail;
         pHdr   = data + sizeof(MsgHdr);
         pBody  = data + off;
         cbBody = size - off;
@@ -102,15 +236,15 @@ namespace {
         if (newSize > sizeof(g_RecvPacketPool[0])) return;
 
         uint8* buf = g_RecvPacketPool[g_RecvPacketPoolIdx];
-        const MsgHdr* orig = reinterpret_cast<const MsgHdr*>(p->m_pubData);
+        const MsgHdr* orig = reinterpret_cast<const MsgHdr*>(NetPkt::Data(p));
         MsgHdr* out = reinterpret_cast<MsgHdr*>(buf);
         out->eMsg         = orig->eMsg;
         out->headerLength = cbNewHdr;
         memcpy(buf + sizeof(MsgHdr), pNewHdr, cbNewHdr);
         if (cbNewBody)
             memcpy(buf + sizeof(MsgHdr) + cbNewHdr, pNewBody, cbNewBody);
-        p->m_pubData = buf;
-        p->m_cubData = newSize;
+        NetPkt::Data(p) = buf;
+        NetPkt::Size(p) = newSize;
 
         g_RecvPacketPoolIdx = (g_RecvPacketPoolIdx + 1) % kPacketPoolSize;
     }
@@ -1346,13 +1480,13 @@ namespace Hooks_NetPacket_RichPresence {
         if (!g_InjectPending || g_cbInjectPkt == 0) return;
         g_InjectPending = false;
 
-        uint8* origData = pCarrier->m_pubData;
-        uint32 origSize = pCarrier->m_cubData;
-        pCarrier->m_pubData = g_InjectPkt;
-        pCarrier->m_cubData = g_cbInjectPkt;
+        uint8* origData = NetPkt::Data(pCarrier);
+        uint32 origSize = NetPkt::Size(pCarrier);
+        NetPkt::Data(pCarrier) = g_InjectPkt;
+        NetPkt::Size(pCarrier) = g_cbInjectPkt;
         invokeOriginal(pThis, pCarrier);
-        pCarrier->m_pubData = origData;
-        pCarrier->m_cubData = origSize;
+        NetPkt::Data(pCarrier) = origData;
+        NetPkt::Size(pCarrier) = origSize;
         LOG_RICHPRESENCE_INFO("Delivered manufactured self-PersonaState ({} bytes)", g_cbInjectPkt);
     }
 
@@ -1579,13 +1713,13 @@ namespace Hooks_NetPacket_Cloud {
                 g_pending.pop_front();
             }
 
-            uint8* origData = pCarrier->m_pubData;
-            uint32 origSize = pCarrier->m_cubData;
-            pCarrier->m_pubData = pkt.data();
-            pCarrier->m_cubData = static_cast<uint32>(pkt.size());
+            uint8* origData = NetPkt::Data(pCarrier);
+            uint32 origSize = NetPkt::Size(pCarrier);
+            NetPkt::Data(pCarrier) = pkt.data();
+            NetPkt::Size(pCarrier) = static_cast<uint32>(pkt.size());
             invokeOriginal(pThis, pCarrier);
-            pCarrier->m_pubData = origData;
-            pCarrier->m_cubData = origSize;
+            NetPkt::Data(pCarrier) = origData;
+            NetPkt::Size(pCarrier) = origSize;
             LOG_NETPACKET_DEBUG("Cloud: delivered {}-byte response", pkt.size());
         }
     }
@@ -1674,13 +1808,13 @@ namespace Hooks_NetPacket_LegacyKey {
                 g_pending.pop_front();
             }
 
-            uint8* origData = pCarrier->m_pubData;
-            uint32 origSize = pCarrier->m_cubData;
-            pCarrier->m_pubData = pkt.data();
-            pCarrier->m_cubData = static_cast<uint32>(pkt.size());
+            uint8* origData = NetPkt::Data(pCarrier);
+            uint32 origSize = NetPkt::Size(pCarrier);
+            NetPkt::Data(pCarrier) = pkt.data();
+            NetPkt::Size(pCarrier) = static_cast<uint32>(pkt.size());
             invokeOriginal(pThis, pCarrier);
-            pCarrier->m_pubData = origData;
-            pCarrier->m_cubData = origSize;
+            NetPkt::Data(pCarrier) = origData;
+            NetPkt::Size(pCarrier) = origSize;
             LOG_NETPACKET_DEBUG("LegacyKey: delivered {}-byte response", pkt.size());
         }
     }
@@ -1708,6 +1842,11 @@ namespace {
             if (std::strcmp(targetJobName, "Cloud.SignalAppExitSyncDone#1") == 0 ||
                 std::strcmp(targetJobName, "Cloud.ClientConflictResolution#1") == 0)
                 return false;
+            // Only swallow the request if we can actually deliver the answer.
+            // Drain() runs from the RecvPkt hook, which does nothing until the
+            // packet layout is known — suppressing the send before then would
+            // leave the job waiting forever on a reply that never comes.
+            if (!NetPkt::IsResolved()) return false;
             if (Hooks_NetPacket_Cloud::HandleSend(targetJobName, pBody, cbBody, pHdr, cbHdr))
                 g_SuppressSend = true;
             return false;   // never body-replace a cloud frame
@@ -1880,7 +2019,12 @@ namespace {
         // Legacy CD-key request (EMsg 730) is a non-proto struct message that
         // UnpackRaw skips. Intercept it here: if we answer it locally, suppress
         // the real send (the 785 response is delivered from the RecvPkt hook).
-        if (cubData >= sizeof(ExtendedMsgHdr)) {
+        // As with the cloud path above: answering locally means the reply is
+        // delivered by Drain() from the RecvPkt hook, which is inert until the
+        // packet layout is identified. Let the request go out normally until
+        // then, or the "Updating product key" dialog waits on a reply that is
+        // never delivered.
+        if (cubData >= sizeof(ExtendedMsgHdr) && NetPkt::IsResolved()) {
             const uint32 rawEMsg = *reinterpret_cast<const uint32*>(pubData);
             if (!(rawEMsg & kMsgHdrProtoFlag) &&
                 static_cast<EMsg>(rawEMsg) == k_EMsgClientGetLegacyGameKey &&
@@ -1921,6 +2065,22 @@ namespace {
 
     HOOK_FUNC(RecvPkt, void*, void* pThis, CNetPacket* pPacket)
     {
+        // Identify the packet layout before anything reads or writes a field.
+        //
+        // This must stay ahead of TryInject/Drain below: those overwrite the
+        // data pointer and size with our own buffers, so probing afterwards
+        // would be measuring whichever offset we had already guessed. Until the
+        // layout is known the packet is handed straight back untouched, so a
+        // field is never accessed at an unverified offset.
+        //
+        // Skipping costs nothing meaningful: RecvJob only acts on protobuf
+        // messages, which is exactly the set the probe latches on, and a Multi
+        // is re-delivered per sub-message. Injections and queued responses are
+        // delayed, not dropped.
+        if (!pPacket) return oRecvPkt(pThis, pPacket);
+        if (!NetPkt::IsResolved() && !TryResolveLayout(pPacket))
+            return oRecvPkt(pThis, pPacket);
+
         Hooks_NetPacket_RichPresence::TryInject(
             pThis, pPacket,
             [](void* pT, CNetPacket* pP) -> bool { return oRecvPkt(pT, pP) != nullptr; });
@@ -1936,7 +2096,7 @@ namespace {
         EMsg eMsg;
         const uint8 *pBody, *pHdr;
         uint32 cbBody, cbHdr;
-        if (UnpackRaw(pPacket->m_pubData, pPacket->m_cubData,
+        if (UnpackRaw(NetPkt::Data(pPacket), NetPkt::Size(pPacket),
                      eMsg, pHdr, cbHdr, pBody, cbBody)) {
             g_ResizedInPlace = false;
             RecvJob(eMsg, pBody, cbBody, pHdr, cbHdr);
@@ -1947,7 +2107,7 @@ namespace {
                     g_NewHdr, g_cbNewHdr,
                     pBody, g_NewBodySize);
             } else if (g_ResizedInPlace) {
-                pPacket->m_cubData = sizeof(MsgHdr) + cbHdr + g_NewBodySize;
+                NetPkt::Size(pPacket) = sizeof(MsgHdr) + cbHdr + g_NewBodySize;
             } else if (g_NeedReplaceHdr || g_NeedReplaceBody) {
                 ReplaceRecvPacket(pPacket,
                     g_NeedReplaceHdr  ? g_NewHdr  : pHdr,
