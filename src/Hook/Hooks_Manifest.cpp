@@ -26,6 +26,7 @@ namespace {
     // missing manifest from stalling Steam for long, and on timeout the original
     // simply takes its normal path, so the worst case is the old behaviour.
     constexpr uint32_t kPreseedFetchTimeoutMs = 5000;
+    constexpr int64_t  kPreseedBudgetMs       = 15000;
 
     // When a pre-seed sweep finds manifests that are not archived yet (404), the
     // depots are collected here and, after a short quiet period, surfaced in one
@@ -58,6 +59,35 @@ namespace {
             const DepotEntry& e = vec->m_Memory.m_pMemory[i];
             if (!e.DepotId || !e.ManifestGid) continue;
             g_depotsSeen[e.DepotId] = {e.AppId, e.ManifestGid};
+        }
+    }
+
+    void PreseedDepots(AppId_t appId, const CUtlVector<DepotEntry>* vec,
+                       const std::unordered_map<uint64_t, LuaConfig::ManifestOverride>& overrides,
+                       std::chrono::steady_clock::time_point deadline)
+    {
+        if (!vec) return;
+        for (uint32 i = 0; i < vec->m_Size; ++i) {
+            const DepotEntry& e = vec->m_Memory.m_pMemory[i];
+            if (!e.DepotId || !e.ManifestGid) continue;
+
+            const bool pinned   = overrides.count(e.DepotId) != 0;
+            const bool unlocked = LuaConfig::HasDepot(e.DepotId, false) &&
+                                  !LuaConfig::IsOwned(e.AppId);
+            if (!pinned && !unlocked) continue;
+
+            const AppId_t app   = appId;
+            const uint32  depot = e.DepotId;
+            const uint64  gid   = e.ManifestGid;
+
+            if (std::chrono::steady_clock::now() < deadline) {
+                ManifestCache::EnsureCached(app, depot, gid, kPreseedFetchTimeoutMs);
+            } else {
+                OSTPlatform::Thread::StartDetached([app, depot, gid]() -> uint32_t {
+                    ManifestCache::EnsureCached(app, depot, gid);
+                    return 0;
+                });
+            }
         }
     }
 
@@ -194,19 +224,17 @@ namespace {
             }
         }
 
-        // No pre-seeding here. It used to run a synchronous sweep over the depot
-        // list on Steam's own thread, fetching manifests for every pinned depot
-        // while Steam was still building depot configs at startup — speculative
-        // work for games that may never be downloaded, and nothing after this
-        // point reads the file anyway.
-        //
-        // YldLoadDepotManifest now covers it properly: it fires at the per-manifest
-        // acquire chokepoint, immediately before the original's own disk check, so
-        // the fetch happens only for a manifest Steam is asking for right now, and
-        // it reaches pinned depots too (the pinned gid was patched into the depot
-        // config just above, so that is the gid Steam goes on to request). It also
-        // covers what this sweep never could: unpinned depots and workshop items,
-        // which do not pass through BuildDepotDependency at all.
+        // If YldLoadDepotManifest hook is installed, it handles pre-seeding
+        // on demand at the per-manifest acquire chokepoint — more precise and
+        // also covers workshop items. If the hook is NOT installed (older Steam
+        // version without that function), fall back to the synchronous sweep
+        // here so unlocked installs still start on the first attempt.
+        if (!oYldLoadDepotManifest) {
+            const auto deadline = std::chrono::steady_clock::now() +
+                                  std::chrono::milliseconds(kPreseedBudgetMs);
+            PreseedDepots(AppId, pDepotInfo, overrides, deadline);
+            PreseedDepots(AppId, pSharedDepotInfo, overrides, deadline);
+        }
         return result;
     }
 
