@@ -139,6 +139,29 @@ namespace {
         });
     }
 
+    // ── Workshop / on-demand manifest pre-seed ──────────────────────────
+    // CDepotDownloadMgr's per-manifest acquire (steamclient: sub_1384B97C0). It
+    // builds <steam>\depotcache\<depot>_<gid>.manifest, checks disk, and only
+    // falls through to BYldRequestDepotManifest (the request-code path) on a
+    // miss. Pre-seeding the manifest here — before the original's own disk check
+    // — makes that check succeed, so the download starts on the FIRST attempt
+    // with no request code. Unlike BuildDepotDependency this fires for every
+    // manifest acquisition, including workshop items (depot == appid), which
+    // never pass through BuildDepotDependency.
+    //
+    //   appId=a3, depotId=a4, manifestGid=a5, branch=a6.
+    HOOK_FUNC(YldLoadDepotManifest, __int64,
+              void* a1, void* a2, int appId, uint32_t depotId,
+              uint64_t manifestGid, const char* branch)
+    {
+        if ( depotId && manifestGid && LuaConfig::HasDepot(depotId) ) {
+            LOG_MANIFEST_DEBUG("YldLoadDepotManifest: pre-seed app={} depot={} gid={} branch={}",
+                               appId, depotId, manifestGid, branch ? branch : "");
+            ManifestCache::EnsureCached(appId, depotId, manifestGid, kPreseedFetchTimeoutMs);
+        }
+        return oYldLoadDepotManifest(a1, a2, appId, depotId, manifestGid, branch);
+    }
+
     HOOK_FUNC(BuildDepotDependency, bool, void* pUserAppMgr, AppId_t AppId,
               void* pUserConfig, CUtlVector<DepotEntry>* pDepotInfo,
               CUtlVector<DepotEntry>* pSharedDepotInfo, void* pSteamApp,
@@ -238,32 +261,6 @@ namespace {
         return result;
     }
 
-    // ── Workshop / on-demand manifest pre-seed ──────────────────────────
-    // CDepotDownloadMgr's per-manifest acquire (steamclient: sub_1384B97C0). It
-    // builds <steam>\depotcache\<depot>_<gid>.manifest, checks disk, and only
-    // falls through to BYldRequestDepotManifest (the request-code path) on a
-    // miss. Pre-seeding the manifest here — before the original's own disk check
-    // — makes that check succeed, so the download starts on the FIRST attempt
-    // with no request code. Unlike BuildDepotDependency this fires for every
-    // manifest acquisition, including workshop items (depot == appid), which
-    // never pass through BuildDepotDependency.
-    //
-    //   appId=a3, depotId=a4, manifestGid=a5, branch=a6.
-    HOOK_FUNC(YldLoadDepotManifest, __int64,
-              void* a1, void* a2, int appId, uint32_t depotId,
-              uint64_t manifestGid, const char* branch)
-    {
-        // Only depots OST unlocks and does not own (lua-added, incl. workshop
-        // apps). A bounded blocking fetch: the original checks disk on the very
-        // next line, so an archive hit converts into a first-attempt success; a
-        // miss just returns and the original takes its normal request-code path.
-        if ( depotId && manifestGid && LuaConfig::HasDepot(depotId) ) {
-            LOG_MANIFEST_DEBUG("YldLoadDepotManifest: pre-seed app={} depot={} gid={} branch={}",
-                               appId, depotId, manifestGid, branch ? branch : "");
-            ManifestCache::EnsureCached(appId, depotId, manifestGid, kPreseedFetchTimeoutMs);
-        }
-        return oYldLoadDepotManifest(a1, a2, appId, depotId, manifestGid, branch);
-    }
 
 } // anonymous namespace
 
