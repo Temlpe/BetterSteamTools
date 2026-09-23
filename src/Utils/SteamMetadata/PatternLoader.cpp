@@ -268,6 +268,51 @@ void* FindPattern(OSTPlatform::DynamicLibrary::ModuleHandle module, const char* 
     return nullptr;
 }
 
+void* FindPatternOptional(OSTPlatform::DynamicLibrary::ModuleHandle module, const char* funcName)
+{
+    if (g_failedModules.count(module)) {
+        return nullptr;
+    }
+
+    uint32_t key = Fnv1aHash(funcName);
+
+    auto mapIt = g_moduleMaps.find(module);
+    if (mapIt == g_moduleMaps.end()) {
+        return nullptr;
+    }
+
+    auto& map = mapIt->second;
+    auto entryIt = map.find(key);
+    if (entryIt == map.end()) {
+        return nullptr;
+    }
+
+    const PatternEntry& entry = entryIt->second;
+
+    if (entry.rva != 0) {
+        void* addr = reinterpret_cast<void*>(
+            reinterpret_cast<uintptr_t>(module) + entry.rva);
+        LOG_DEBUG("PatternLoader: {} resolved via RVA 0x{:X} (optional)", funcName, entry.rva);
+        return addr;
+    }
+
+    if (!entry.sig.empty()) {
+        std::vector<uint8_t> bytes, mask;
+        if (ParseSig(entry.sig, bytes, mask)) {
+            void* addr = ScanModule(module, bytes, mask);
+            if (addr) {
+                uintptr_t rva = reinterpret_cast<uintptr_t>(addr) -
+                                reinterpret_cast<uintptr_t>(module);
+                LOG_DEBUG("PatternLoader: {} resolved via sig @ RVA 0x{:X} (optional)",
+                          funcName, rva);
+                return addr;
+            }
+        }
+    }
+
+    return nullptr;
+}
+
 void ReportMissingFunctions()
 {
     if (g_missingFunctions.empty()) return;

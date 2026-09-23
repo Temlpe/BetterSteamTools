@@ -269,7 +269,7 @@ namespace Hooks_Manifest {
     void Install() {
         HOOK_BEGIN();
         INSTALL_HOOK_C(BuildDepotDependency);
-        INSTALL_HOOK_C(YldLoadDepotManifest);
+        INSTALL_HOOK_OPTIONAL_C(YldLoadDepotManifest);
         HOOK_END();
     }
 
