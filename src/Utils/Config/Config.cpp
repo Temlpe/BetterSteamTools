@@ -12,6 +12,7 @@ namespace {
 
     struct Snapshot {
         std::string manifestProvider = "opensteamtool";
+        std::string manifestArchiveUrl;
         ManifestTimeouts manifestTimeouts;
         LogLevel logLevel = LogLevel::Debug;
         std::string logDir;
@@ -50,6 +51,7 @@ namespace {
         manifestTimeoutConnect = snapshot.manifestTimeouts.connect;
         manifestTimeoutSend    = snapshot.manifestTimeouts.send;
         manifestTimeoutRecv    = snapshot.manifestTimeouts.recv;
+        manifestArchiveUrl     = snapshot.manifestArchiveUrl;
         logLevel               = snapshot.logLevel;
         logDir                 = snapshot.logDir;
         luaPaths               = snapshot.luaPaths;
@@ -103,6 +105,9 @@ namespace {
             if (auto manifest = tbl["manifest"].as_table()) {
                 if (auto val = (*manifest)["url"].value<std::string>()) {
                     snapshot.manifestProvider = *val;
+                }
+                if (auto val = (*manifest)["archive_url"].value<std::string>()) {
+                    snapshot.manifestArchiveUrl = *val;
                 }
                 if (auto val = (*manifest)["timeout_resolve_ms"].value<int64_t>())
                     snapshot.manifestTimeouts.resolve = static_cast<uint32_t>(*val);
@@ -262,6 +267,11 @@ namespace {
             manifestTimeoutSend,
             manifestTimeoutRecv,
         };
+    }
+
+    std::string GetManifestArchiveUrl() {
+        std::lock_guard lock(g_mutex);
+        return manifestArchiveUrl;
     }
 
     LogLevel GetLogLevel() {

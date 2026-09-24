@@ -27,7 +27,17 @@ namespace {
     // Base URL of the OST manifest archive, behind Cloudflare. Baked in on
     // purpose: it is infrastructure, not a user setting, so there is no config
     // knob for it. Update this (and rebuild) if the archive ever moves.
-    constexpr const char* kArchiveBaseUrl = "https://manifest.luastools.xyz";
+    constexpr const char* kDefaultArchiveBaseUrl = "https://manifest.luastools.xyz";
+
+    bool ArchiveEnabled() {
+        return !Config::GetManifestArchiveUrl().empty();
+    }
+
+    std::string ArchiveBaseUrl() {
+        std::string url = Config::GetManifestArchiveUrl();
+        while (!url.empty() && url.back() == '/') url.pop_back();
+        return url;
+    }
 
     // Real manifests reach ~19 MB; 64 MB leaves generous headroom while still
     // bounding what a hostile origin can make us buffer. Mirrors the server's
@@ -133,6 +143,7 @@ bool EnsureCached(AppId_t app, uint32_t depot, uint64_t gid,
                   bool bypassNegativeCache) {
     if (outNotArchived) *outNotArchived = false;
     if (!depot || !gid) return false;
+    if (!ArchiveEnabled()) return false;
 
     const fs::path dir = DepotCacheDir();
     if (dir.empty()) {
@@ -166,7 +177,7 @@ bool EnsureCached(AppId_t app, uint32_t depot, uint64_t gid,
     // Re-check after taking the slot: the other worker may have just finished.
     if (fs::exists(dest, ec)) return true;
 
-    const std::string url = std::format("{}/m/{}/{}", kArchiveBaseUrl, depot, gid);
+    const std::string url = std::format("{}/m/{}/{}", ArchiveBaseUrl(), depot, gid);
     const auto to = Config::GetManifestTimeouts();
     const uint32_t recvTo = recvTimeoutMs ? recvTimeoutMs : kRecvTimeoutMs;
     const auto resp = OSTPlatform::Http::Execute(

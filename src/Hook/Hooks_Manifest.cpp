@@ -2,6 +2,7 @@
 #include "HookMacros.h"
 #include "dllmain.h"
 #include "OSTPlatform/include/Thread.h"
+#include "Utils/Config/Config.h"
 #include "Utils/SteamMetadata/ManifestCache.h"
 #include "OSTPlatform/include/Dialog.h"
 #include <atomic>
@@ -67,6 +68,7 @@ namespace {
                        std::chrono::steady_clock::time_point deadline)
     {
         if (!vec) return;
+        if (Config::GetManifestArchiveUrl().empty()) return;
         for (uint32 i = 0; i < vec->m_Size; ++i) {
             const DepotEntry& e = vec->m_Memory.m_pMemory[i];
             if (!e.DepotId || !e.ManifestGid) continue;
@@ -154,7 +156,8 @@ namespace {
               void* a1, void* a2, int appId, uint32_t depotId,
               uint64_t manifestGid, const char* branch)
     {
-        if ( depotId && manifestGid && LuaConfig::HasDepot(depotId) ) {
+        if ( depotId && manifestGid && LuaConfig::HasDepot(depotId) &&
+             !Config::GetManifestArchiveUrl().empty() ) {
             LOG_MANIFEST_DEBUG("YldLoadDepotManifest: pre-seed app={} depot={} gid={} branch={}",
                                appId, depotId, manifestGid, branch ? branch : "");
             ManifestCache::EnsureCached(appId, depotId, manifestGid, kPreseedFetchTimeoutMs);

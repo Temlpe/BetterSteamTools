@@ -1081,13 +1081,15 @@ namespace Hooks_NetPacket_Manifest {
             // user download, false at idle startup when Steam is only retrying its
             // scheduled-update queue.
             const bool active = Hooks_SteamUI::ActiveDownloadCount() > 0;
-            OSTPlatform::Thread::StartDetached([a, d, g, active]() -> uint32_t {
-                bool notArchived = false;
-                bool ok = ManifestCache::EnsureCached(a, d, g, 0, &notArchived, /*bypassNeg=*/active);
-                if (active && !ok && notArchived)
-                    Hooks_Manifest::ReportMissingManifest(d, g);
-                return 0;
-            });
+            if (!Config::GetManifestArchiveUrl().empty()) {
+                OSTPlatform::Thread::StartDetached([a, d, g, active]() -> uint32_t {
+                    bool notArchived = false;
+                    bool ok = ManifestCache::EnsureCached(a, d, g, 0, &notArchived, /*bypassNeg=*/active);
+                    if (active && !ok && notArchived)
+                        Hooks_Manifest::ReportMissingManifest(d, g);
+                    return 0;
+                });
+            }
         }
 
         // Note: a manifest already present in config\depotcache does NOT let us

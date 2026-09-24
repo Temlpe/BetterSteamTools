@@ -39,6 +39,7 @@ namespace Config {
     LoadResult Load(const std::string& configPath);
 
     ManifestTimeouts GetManifestTimeouts();
+    std::string GetManifestArchiveUrl();
     LogLevel GetLogLevel();
     std::string GetLogDir();
     std::vector<std::string> GetLuaPaths();
@@ -64,6 +65,10 @@ namespace Config {
     inline uint32_t manifestTimeoutConnect = 5000;
     inline uint32_t manifestTimeoutSend    = 10000;
     inline uint32_t manifestTimeoutRecv    = 10000;
+    // [manifest] archive_url — when set, ManifestCache downloads manifest files
+    // from this base URL. When empty (default), ManifestCache is disabled and
+    // manifest request codes are obtained via ManifestClient instead.
+    inline std::string manifestArchiveUrl;
 
     // [log]
     inline LogLevel logLevel = LogLevel::Debug;

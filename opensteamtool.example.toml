@@ -46,6 +46,13 @@ level = "debug"
 # end
 url = "opensteamtool"
 
+# Manifest archive URL. When set, manifest files are pre-downloaded from this
+# base URL (e.g. https://manifest.luastools.xyz) and cached locally so Steam can
+# install without requesting manifest codes. When unset (default), the archive is
+# disabled and manifest request codes are obtained via the "url" provider above
+# (opensteamtool/wudrm/steamrun) or Lua functions instead.
+# archive_url = "https://manifest.luastools.xyz"
+
 # HTTP timeouts for manifest requests (milliseconds).
 # timeout_resolve_ms  — DNS resolution        (default: 5000)
 # timeout_connect_ms  — TCP handshake          (default: 5000)
